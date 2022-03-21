@@ -15,8 +15,6 @@ class BufferReader():
         return self.offset >= len(self.data)
 
     def unpack(self, format, *, peek=False, offset=0):
-        format = f">{format}"
-
         start = self.offset + offset
         if start >= len(self.data):
             raise IndexError
@@ -62,10 +60,39 @@ class TemplateParam():
         self.name = name
         self.value = value
 
-class TypeIdentity():
-    def __init__(self, name, template):
-        self.name = name
-        self.template = template
+    def is_type(self):
+        return self.name[0] == 't'
+
+class Type():
+    def __init__(self):
+        self.name = None
+        self.template = None
+        self.parent = None
+        self.size = None
+        self.align = None
+        self.fields = None
+
+    def get_name(self):
+        template = self.template
+
+        if len(template) == 0:
+            return self.name
+
+        if self.name == "T*":
+            return f"{template[0].value.get_name()}*"
+        if self.name == "T[N]":
+            return (f"{template[0].value.get_name()}"
+                    f"[{template[1].value}]")
+
+        params = []
+
+        for param in template:
+            if param.is_type():
+                params.append(param.value.get_name())
+            else:
+                params.append(f"{param.value}")
+
+        return f"{self.name}<{', '.join(params)}>"
 
 def read_string(file):
     result = b""
@@ -84,7 +111,7 @@ def read_string_section(file):
 
 def decode_varint(file):
     """Returns tuple of size and value"""
-    value, = file.unpack("Q", peek=True)
+    value, = file.unpack(">Q", peek=True)
     msb = bitutil.reverse_extract64(value, 0, 7)
     mode = msb >> 3
 
@@ -103,7 +130,7 @@ def decode_varint(file):
     if mode == 31 and (msb & 7) == 0:
         return (6, bitutil.reverse_extract64(value, 8, 48 - 1))
     if mode == 31 and (msb & 7) == 1:
-        return (9, file.unpack("Q", peek=True, offset=1)[0])
+        return (9, file.unpack(">Q", peek=True, offset=1)[0])
 
     raise HkxException(f"Bad varint encoding mode {msb:02X}")
 
@@ -148,7 +175,7 @@ def read_opts(file):
     return sum(flag for i, flag in enumerate(FLAGS) if value & (1 << i))
 
 def read_section(file):
-    size_and_flags, tag = file.unpack("I4s")
+    size_and_flags, tag = file.unpack(">I4s")
     flags = size_and_flags >> 30
     size = size_and_flags & ((1 << 30) - 1)
     return Section(flags, size, tag.decode())
@@ -169,19 +196,34 @@ def read_sections(file, section_handlers):
 class HkxParser():
     def __init__(self):
         self.tstr = None
-        self.tna1 = None
         self.fstr = None
+        self.types = None
 
     def TAG0(self, file, header):
         read_sections(BufferReader(file.read(header.data_size)), {
+            'DATA': self.DATA,
             'INDX': self.INDX,
             'SDKV': self.SDKV,
             'TYPE': self.TYPE,
         })
 
+    def DATA(self, file, header):
+        IndentPrint.print("DATA")
+        self.data = file.read(header.data_size)
+
     def INDX(self, file, header):
         IndentPrint.print("INDX")
-        read_sections(BufferReader(file.read(header.data_size)), {})
+        read_sections(BufferReader(file.read(header.data_size)), {
+            'ITEM': self.ITEM
+        })
+
+    def ITEM(self, file, header):
+        IndentPrint.print("ITEM")
+        inner = BufferReader(file.read(header.data_size))
+        IndentPrint.level += 1
+        while not inner.eof():
+            self.read_item(inner)
+        IndentPrint.level -= 1
 
     def SDKV(self, file, header):
         IndentPrint.print(f"SDKV: {file.read(header.data_size).decode()}")
@@ -204,11 +246,14 @@ class HkxParser():
 
     def TNA1(self, file, header):
         IndentPrint.print("TNA1")
+        if self.types is not None:
+            raise HkxException("Found multiple TNA1 sections")
         inner = BufferReader(file.read(header.data_size))
         count = read_varint_s32(inner)
         IndentPrint.level += 1
-        self.tna1 = [None]
-        self.tna1 += [self.read_type_identity(inner) for _ in range(1, count)]
+        self.types = [None] + [Type() for _ in range(1, count)]
+        for i in range(1, count):
+            self.read_type_identity(inner, self.types[i])
         IndentPrint.level -= 1
 
     def FSTR(self, file, header):
@@ -226,135 +271,120 @@ class HkxParser():
             self.read_type_body(inner)
         IndentPrint.level -= 1
 
-    def get_type_name(self, id):
-        identity = self.tna1[id]
-        basename = self.tstr[identity.name]
-        template = identity.template
-
-        if len(template) == 0:
-            return basename
-
-        if basename == "T*":
-            return f"{self.get_type_name(template[0].value)}*"
-        if basename == "T[N]":
-            return (f"{self.get_type_name(template[0].value)}"
-                    f"[{template[1].value}]")
-
-        params = []
-
-        for param in template:
-            name = self.tstr[param.name]
-            if name[0] == 'v':
-                params.append(f"{param.value}")
-            elif name[0] == 't':
-                params.append(self.get_type_name(param.value))
+    def read_type_identity(self, file, typ):
+        typ.name        = self.tstr[read_varint_s32(file)]
+        typ.template    = []
+        for _ in range(read_varint_s32(file)):
+            param_name = self.tstr[read_varint_s32(file)]
+            if param_name[0] == 't':
+                param_value = self.types[read_varint_s32(file)]
             else:
-                raise NotImplementedError
-
-        return f"{basename}<{', '.join(params)}>"
-
-    def read_type_identity(self, file):
-        name            = read_varint_s32(file)
-        template_count  = read_varint_s32(file)
-        template        = []
-
-        for _ in range(template_count):
-            param_name = read_varint_s32(file)
-            param_value = read_varint_s32(file)
-            template.append(TemplateParam(param_name, param_value))
-
-        return TypeIdentity(name, template)
+                param_value = read_varint_s32(file)
+            typ.template.append(TemplateParam(param_name, param_value))
 
     def read_type_body(self, file):
         id = read_varint_s32(file)
         if id == 0:
             return
 
-        parent = read_varint_s32(file)
-        opts = read_opts(file)
+        typ = self.types[id]
 
-        fmt        = 0
-        subtype    = 0
-        version    = None
-        size       = None
-        align      = None
-        fields     = []
-        interfaces = []
-        attribute  = None
+        typ.parent = self.types[read_varint_s32(file)]
+        typ.opts = read_opts(file)
 
-        if opts & Opt.FORMAT:
-            fmt = read_varint_u32(file)
-        if opts & Opt.SUBTYPE:
-            if fmt == 0:
+        typ.fmt        = 0
+        typ.subtype    = None
+        typ.version    = None
+        typ.size       = None
+        typ.align      = None
+        typ.fields     = []
+        typ.interfaces = []
+        typ.attribute  = None
+
+        if typ.opts & Opt.FORMAT:
+            typ.fmt = read_varint_u32(file)
+        if typ.opts & Opt.SUBTYPE:
+            if typ.fmt == 0:
                 raise HkxException("Invalid type with Opt::SUBTYPE optional "
                                    "but no Opt::FORMAT.")
-            subtype = read_varint_s32(file)
-        if opts & Opt.VERSION:
-            version = read_varint_s32(file)
-        if opts & Opt.SIZE_ALIGN:
-            size  = read_varint_u32(file)
-            align = read_varint_u32(file)
-        if opts & Opt.UNK24:
+            typ.subtype = self.types[read_varint_s32(file)]
+        if typ.opts & Opt.VERSION:
+            typ.version = read_varint_s32(file)
+        if typ.opts & Opt.SIZE_ALIGN:
+            typ.size  = read_varint_u32(file)
+            typ.align = read_varint_u32(file)
+        if typ.opts & Opt.UNK24:
             unk24 = read_varint_u16(file)
-        if opts & Opt.FIELDS:
+        if typ.opts & Opt.FIELDS:
             field_count_pair  = read_varint_s32(file)
             field_count       = bitutil.extract(field_count_pair, 0, 15)
             placeholder_count = bitutil.extract(field_count_pair, 16, 31)
             for _ in range(field_count):
-                field_name  = read_varint_u16(file)
+                field_name  = self.fstr[read_varint_u16(file)]
                 field_flags = read_varint_u16(file)
                 field_unk   = read_varint_u16(file)
-                field_type  = read_varint_s32(file)
-                fields.append(Field(field_type, field_name, field_flags))
+                field_type  = self.types[read_varint_s32(file)]
+                typ.fields.append(Field(field_type, field_name, field_flags))
             for _ in range(placeholder_count):
-                fields.append(Field(None, None))
-        if opts & Opt.INTERFACES:
+                typ.fields.append(Field(None, None))
+        if typ.opts & Opt.INTERFACES:
             interface_count = read_varint_s32(file)
             for _ in range(interface_count):
-                interface_type = read_varint_s32(file)
-                interface_name = read_varint_s32(file)
-                interfaces.append(Field(interface_type, interface_name))
-        if opts & Opt.ATTRIBUTE:
-            attribute = read_varint_s32(file)
+                interface_type = self.types[read_varint_s32(file)]
+                interface_name = self.fstr[read_varint_s32(file)]
+                typ.interfaces.append(Field(interface_type, interface_name))
+        if typ.opts & Opt.ATTRIBUTE:
+            typ.attribute = read_varint_s32(file)
 
-        IndentPrint.print(f"type body {self.get_type_name(id)}")
+        IndentPrint.print(f"type body {typ.get_name()} ({id})")
         IndentPrint.level += 1
 
-        if parent != 0:
-            IndentPrint.print(f"parent    {self.get_type_name(parent)}")
-        IndentPrint.print(f"opts      {opts:08X}")
-        if fmt != 0:
-            IndentPrint.print(f"format    {fmt:08X} ({fmt & 0x1F})")
-        if subtype != 0:
-            IndentPrint.print(f"subtype   {self.get_type_name(subtype)}")
-        if version is not None:
-            IndentPrint.print(f"version   {version}")
-        if size is not None:
-            IndentPrint.print(f"size      {size}")
-            IndentPrint.print(f"align     {align}")
-        if attribute is not None:
-            IndentPrint.print(f"attribute {attribute}")
-        if len(fields) != 0:
+        if typ.parent is not None:
+            IndentPrint.print(f"parent    {typ.parent.get_name()}")
+        IndentPrint.print(f"opts      {typ.opts:08X}")
+        if typ.fmt != 0:
+            IndentPrint.print(f"format    {typ.fmt:08X} ({typ.fmt & 0x1F})")
+        if typ.subtype is not None:
+            IndentPrint.print(f"subtype   {typ.subtype.get_name()}")
+        if typ.version is not None:
+            IndentPrint.print(f"version   {typ.version}")
+        if typ.size is not None:
+            IndentPrint.print(f"size      {typ.size}")
+            IndentPrint.print(f"align     {typ.align}")
+        if typ.attribute is not None:
+            IndentPrint.print(f"attribute {typ.attribute}")
+        if len(typ.fields) != 0:
             IndentPrint.print("fields")
             IndentPrint.level += 1
-            for field in fields:
+            for field in typ.fields:
                 if field.name is not None:
-                    IndentPrint.print(f"{self.get_type_name(field.type)} "
-                                      f"{self.fstr[field.name]}")
+                    IndentPrint.print(f"{field.type.get_name()} {field.name}")
                 else:
                     IndentPrint.print(f"$PLACEHOLDER$")
             IndentPrint.level -= 1
-        if len(interfaces) != 0:
+        if len(typ.interfaces) != 0:
             IndentPrint.print("interfaces")
             IndentPrint.level += 1
-            for field in interfaces:
+            for field in typ.interfaces:
                 if field.name is not None:
-                    IndentPrint.print(f"{self.get_type_name(field.type)} "
-                                      f"{self.fstr[field.name]}")
-                else:
-                    IndentPrint.print(f"$PLACEHOLDER$")
+                    IndentPrint.print(f"{field.type.get_name()} {field.name}")
             IndentPrint.level -= 1
 
+        IndentPrint.level -= 1
+
+    def read_item(self, file):
+        type_and_flags, offset, count = file.unpack("<III")
+        type_id = bitutil.extract(type_and_flags, 0, 23)
+        flags   = bitutil.extract(type_and_flags, 24, 31)
+        if type_id == 0:
+            return
+        typ = self.types[type_id]
+        IndentPrint.print("item")
+        IndentPrint.level += 1
+        IndentPrint.print(f"type   {typ.get_name()}")
+        IndentPrint.print(f"flags  {flags:02X}")
+        IndentPrint.print(f"offset {offset:08X}")
+        IndentPrint.print(f"count  {count}")
         IndentPrint.level -= 1
 
 def main():
