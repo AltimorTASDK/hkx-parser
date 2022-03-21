@@ -72,15 +72,21 @@ class Type():
         self.align = None
         self.fields = None
 
+    def is_pointer(self):
+        return self.name == "T*"
+
+    def is_array(self):
+        return self.name == "T[N]"
+
     def get_name(self):
         template = self.template
 
         if len(template) == 0:
             return self.name
 
-        if self.name == "T*":
+        if self.is_pointer():
             return f"{template[0].value.get_name()}*"
-        if self.name == "T[N]":
+        if self.is_array():
             return (f"{template[0].value.get_name()}"
                     f"[{template[1].value}]")
 
@@ -159,6 +165,17 @@ class Opt():
     UNK24      = 0x01000000
     FIELDS     = 0x04000000
     ATTRIBUTE  = 0x10000000
+
+class Format():
+    VOID    = 0
+    OPAQUE  = 1
+    BOOL    = 2
+    STRING  = 3
+    INT     = 4
+    FLOAT   = 5
+    POINTER = 6
+    RECORD  = 7
+    ARRAY   = 8
 
 def read_opts(file):
     FLAGS = [
@@ -336,7 +353,7 @@ class HkxParser():
         if typ.opts & Opt.ATTRIBUTE:
             typ.attribute = read_varint_s32(file)
 
-        IndentPrint.print(f"type body {typ.get_name()} ({id})")
+        IndentPrint.print(f"type body {id}: {typ.get_name()}")
         IndentPrint.level += 1
 
         if typ.parent is not None:
