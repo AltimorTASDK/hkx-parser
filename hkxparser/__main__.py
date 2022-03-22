@@ -569,8 +569,8 @@ class HkxParser():
         return value
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: hkx-parser.py <input.hkx>", file=sys.stderr)
+    if len(sys.argv) < 3:
+        print("Usage: hkx-parser.py <input.hkx> <output.json>", file=sys.stderr)
         sys.exit(1)
 
     with open(sys.argv[1], "rb") as f:
@@ -580,7 +580,7 @@ def main():
     read_sections(BufferReader(data), {'TAG0': hkx.TAG0})
     value = hkx.deserialize_item(hkx.data, hkx.items[1])
 
-    with open("output.xml", "w") as f:
+    with open(sys.argv[2], "w") as f:
         print(json.dump(value, f, indent=4))
 
 if __name__ == "__main__":
